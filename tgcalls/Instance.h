@@ -52,6 +52,7 @@ struct RtcServer {
 	std::string password;
 	bool isTurn = false;
     bool isTcp = false;
+    bool isTls = false;
 };
 
 enum class EndpointType {
@@ -123,6 +124,9 @@ struct Config {
     std::vector<std::string> preferredVideoCodecs;
     ProtocolVersion protocolVersion = ProtocolVersion::V0;
     std::string customParameters = "";
+    // Разрешает резервные маршруты к релеям по TCP и TLS. Без него реализации
+    // берут только UDP-адреса, как в апстриме.
+    bool relayTcpTls = false;
 };
 
 struct EncryptionKey {
