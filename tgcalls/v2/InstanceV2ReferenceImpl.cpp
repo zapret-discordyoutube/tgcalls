@@ -58,7 +58,7 @@
 #include "v2/ExternalSignalingConnection.h"
 #include "v2/SignalingSctpConnection.h"
 #include "v2/ReflectorRelayPortFactory.h"
-#include "v2/MtProtoIceTransport.h"
+#include "v2/MtProtoDtlsTransport.h"
 #include "v2/CustomParameters.h"
 #ifdef WEBRTC_IOS
 #include "platform/darwin/iOS/tgcalls_audio_device_module_ios.h"
@@ -525,14 +525,14 @@ public:
 
         _useMtProto = getCustomParameterBool(_customParameters, "network_use_mtproto");
         if (_useMtProto) {
-            // Selects CreateUnencryptedRtpTransport - a plain RtpTransport, the
-            // same class 13.0.0 uses - instead of DtlsSrtpTransport. NOT optional:
-            // SrtpTransport hard-fails when SRTP is inactive (send returns false,
-            // receive drops), so without this the call is either double-encrypted
-            // or dead. Nothing ends up unencrypted: mtproto replaces DTLS-SRTP.
-            // Must precede CreatePeerConnectionOrError, where DtlsEnabled() is read.
+            // Half one of two that MUST travel together (the other is the
+            // MtProtoDtlsTransportFactory on the dependencies below). Selects the
+            // plain RtpTransport (no SRTP) while DTLS stays enabled for SDP, so
+            // certificates, fingerprints, the SCTP factory and data-channel
+            // negotiation are stock; the factory then puts mtproto in the DTLS
+            // slot with no handshake. Must precede CreatePeerConnectionOrError.
             webrtc::PeerConnectionFactoryInterface::Options factoryOptions;
-            factoryOptions.disable_encryption = true;
+            factoryOptions.external_transport_security = true;
             _peerConnectionFactory->SetOptions(factoryOptions);
         }
 
@@ -558,7 +558,7 @@ public:
 
                 if (strong->_didBeginNegotiation) {
                     if (strong->_encryptionKey.isOutgoing || strong->_peerConnection->remote_description()) {
-                        strong->requestRenegotiation();
+                        strong->sendLocalDescription();
                     }
                 } else {
                     RTC_LOG(LS_INFO) << "onRenegotiationNeeded: not sending local description";
@@ -816,7 +816,8 @@ public:
         }
 
         if (_useMtProto) {
-            peerConnectionDependencies.ice_transport_factory = std::make_unique<MtProtoIceTransportFactory>(_encryptionKey);
+            // Half two: see the factory option above.
+            peerConnectionDependencies.dtls_transport_factory = std::make_unique<MtProtoDtlsTransportFactory>(_encryptionKey);
         }
 
         auto peerConnectionOrError = _peerConnectionFactory->CreatePeerConnectionOrError(peerConnectionConfiguration, std::move(peerConnectionDependencies));
@@ -1137,30 +1138,6 @@ public:
         return webrtc::RTCError(webrtc::RTCErrorType::INTERNAL_ERROR, "AddTrack produced no matching transceiver");
     }
 
-    void requestRenegotiation() {
-        if (!_didBeginNegotiation) {
-            return;
-        }
-        _pendingRenegotiation = true;
-        flushPendingRenegotiation();
-    }
-
-    void flushPendingRenegotiation() {
-        if (!_pendingRenegotiation || _isMakingOffer || _isSettingRemoteAnswerPending) {
-            return;
-        }
-        if (_peerConnection->signaling_state() != webrtc::PeerConnectionInterface::SignalingState::kStable) {
-            return;
-        }
-        // A callee must not offer before receiving the caller's first offer:
-        // rolling that offer back can orphan its unnegotiated data-channel MID.
-        if (!_encryptionKey.isOutgoing && !_peerConnection->remote_description()) {
-            return;
-        }
-        _pendingRenegotiation = false;
-        sendLocalDescription();
-    }
-
     void sendLocalDescription() {
         const auto weak = std::weak_ptr<InstanceV2ReferenceImplInternal>(shared_from_this());
 
@@ -1188,6 +1165,9 @@ public:
                 strong->doSendLocalDescription();
 
                 strong->maybeCommitPendingIceCandidates();
+
+                // An answer just took us back to stable; after an offer this is
+                // a no-op until its answer lands.
                 strong->flushPendingRenegotiation();
             });
         }));
@@ -1228,6 +1208,40 @@ public:
         }
 
         _peerConnection->SetLocalDescription(observer);
+    }
+
+    void requestRenegotiation() {
+        // A capture change wants a new offer, but only from a quiet stable
+        // state: never while our own offer is in flight, never while we owe or
+        // await an answer, and on the callee never before the caller's first
+        // offer has arrived - an unsolicited callee offer collides with it and
+        // rolls it back, and a rollback of the very first offer orphans the
+        // data-channel mid in WebRTC (an endless offer/answer loop; this is
+        // what wedged every 18/19 video call). Otherwise remember it and send
+        // once the exchange settles, rather than trusting WebRTC to re-raise
+        // OnRenegotiationNeeded past its negotiation-needed latch.
+        if (!_didBeginNegotiation) {
+            return;
+        }
+        _pendingRenegotiation = true;
+        flushPendingRenegotiation();
+    }
+
+    void flushPendingRenegotiation() {
+        if (!_pendingRenegotiation) {
+            return;
+        }
+        if (_isMakingOffer || _isSettingRemoteAnswerPending) {
+            return;
+        }
+        if (_peerConnection->signaling_state() != webrtc::PeerConnectionInterface::SignalingState::kStable) {
+            return;
+        }
+        if (!_encryptionKey.isOutgoing && !_peerConnection->remote_description()) {
+            return;
+        }
+        _pendingRenegotiation = false;
+        sendLocalDescription();
     }
 
     void sendIceCandidate(const webrtc::IceCandidateInterface *iceCandidate) {
@@ -1494,6 +1508,8 @@ public:
                 if (type == "offer") {
                     strong->sendLocalDescription();
                 }
+                // After an offer we are now making the answer (no-op); after an
+                // answer we are stable and a deferred capture change may go out.
                 strong->flushPendingRenegotiation();
             });
         }));
@@ -1982,6 +1998,8 @@ private:
     bool _didBeginNegotiation = false;
     bool _isMakingOffer = false;
     bool _isSettingRemoteAnswerPending = false;
+    // setVideoCapture() asked for a new offer while one was in flight, an
+    // answer was pending, or (callee) the first remote offer had not arrived.
     bool _pendingRenegotiation = false;
     bool _isPerformingConfiguration = false;
     bool _useAddTrack = false;
